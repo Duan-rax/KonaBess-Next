@@ -24,17 +24,30 @@ class RuntimeGpuFrequencyProbeTest {
 
     @Test
     fun `MHz fallback is converted to Hz`() {
-        val candidate = RuntimeGpuFrequencyProbe.candidates.single {
+        val candidates = RuntimeGpuFrequencyProbe.candidates.filter {
             it.command.endsWith("/freq_table_mhz")
         }
 
+        assertTrue(candidates.size > 1)
+        for (candidate in candidates) {
+            assertEquals(
+                listOf(1_200_000_000L, 902_000_000L, 160_000_000L),
+                RuntimeGpuFrequencyProbe.parse(listOf("1200 902 160"), candidate),
+            )
+        }
+    }
+
+    @Test
+    fun `legacy kHz tables and current GPU samples are normalized to Hz`() {
+        val candidate = RuntimeGpuFrequencyProbe.candidates.first { it.legacyKhz }
         assertEquals(
-            listOf(1_200_000_000L, 902_000_000L, 160_000_000L),
-            RuntimeGpuFrequencyProbe.parse(
-                listOf("1200 902 160"),
-                candidate,
-            ),
+            listOf(1_200_000_000L, 160_000_000L),
+            RuntimeGpuFrequencyProbe.parse(listOf("1200000 160000"), candidate),
         )
+        assertEquals(160_000_000L, parseCurrentGpuFrequencyHz("160", "/gpu/clock_mhz"))
+        assertEquals(160_000_000L, parseCurrentGpuFrequencyHz("160000", "/gpu/cur_freq"))
+        assertEquals(160_000_000L, parseCurrentGpuFrequencyHz("160000000", "/gpu/gpuclk"))
+        assertEquals(0L, parseCurrentGpuFrequencyHz("unavailable", "/gpu/clock_mhz"))
     }
 
     @Test

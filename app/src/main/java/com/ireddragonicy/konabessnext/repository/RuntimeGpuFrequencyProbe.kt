@@ -3,35 +3,43 @@ package com.ireddragonicy.konabessnext.repository
 /**
  * Kernel nodes that may expose the active Adreno frequency table.
  *
- * Most nodes report Hz (or the legacy kHz values handled by callers), while
- * [freq_table_mhz] is explicitly documented by its name and must be converted
- * before it can be used to match a DTS bin or lock a stability-test frequency.
+ * The explicitly named MHz nodes and legacy kHz tables are converted to Hz
+ * before values can be used to match a DTS bin or lock a test frequency.
  */
 internal object RuntimeGpuFrequencyProbe {
     internal data class Candidate(
         val command: String,
         val multiplierToHz: Long = 1L,
+        val legacyKhz: Boolean = false,
     )
+
+    val platformKgslRoots = listOf(
+        "/sys/devices/platform/soc/*.qcom,kgsl-3d0/kgsl/kgsl-3d0",
+        "/sys/devices/platform/soc@0/*.qcom,kgsl-3d0/kgsl/kgsl-3d0",
+        "/sys/devices/platform/*.qcom,kgsl-3d0/kgsl/kgsl-3d0",
+    )
+    // Match this GPU's devfreq device, excluding GPU bus and bandwidth monitors.
+    const val CLASS_DEVFREQ_GPU = "/sys/class/devfreq/*.qcom,kgsl-3d0"
 
     val candidates: List<Candidate> = listOf(
         Candidate("cat /sys/class/kgsl/kgsl-3d0/gpu_available_frequencies"),
-        Candidate("cat /sys/class/kgsl/kgsl-3d0/frequencies"),
-        Candidate("cat /sys/class/kgsl/kgsl-3d0/available_frequencies"),
-        Candidate("cat /sys/class/kgsl/kgsl-3d0/devfreq/available_frequencies"),
-        Candidate("cat /sys/devices/platform/soc/*.qcom,kgsl-3d0/kgsl/kgsl-3d0/frequencies"),
-        Candidate("cat /sys/devices/platform/soc/*.qcom,kgsl-3d0/kgsl/kgsl-3d0/available_frequencies"),
-        Candidate("cat /sys/devices/platform/soc@0/*.qcom,kgsl-3d0/kgsl/kgsl-3d0/frequencies"),
-        Candidate("cat /sys/devices/platform/*.qcom,kgsl-3d0/kgsl/kgsl-3d0/frequencies"),
-        Candidate(
-            command = "cat /sys/class/kgsl/kgsl-3d0/freq_table_mhz",
-            multiplierToHz = 1_000_000L,
-        ),
-    )
+        Candidate("cat /sys/class/kgsl/kgsl-3d0/frequencies", legacyKhz = true),
+        Candidate("cat /sys/class/kgsl/kgsl-3d0/available_frequencies", legacyKhz = true),
+        Candidate("cat /sys/class/kgsl/kgsl-3d0/devfreq/available_frequencies", legacyKhz = true),
+        Candidate("cat $CLASS_DEVFREQ_GPU/available_frequencies", legacyKhz = true),
+    ) + platformKgslRoots.flatMap { root ->
+        listOf(
+            Candidate("cat $root/gpu_available_frequencies"),
+            Candidate("cat $root/frequencies", legacyKhz = true),
+            Candidate("cat $root/available_frequencies", legacyKhz = true),
+        )
+    } + listOf(Candidate("cat /sys/class/kgsl/kgsl-3d0/freq_table_mhz", 1_000_000L)) +
+        platformKgslRoots.map { Candidate("cat $it/freq_table_mhz", 1_000_000L) }
 
     fun parse(lines: List<String>, candidate: Candidate): List<Long> {
         if (lines.isEmpty()) return emptyList()
 
-        return lines.asSequence()
+        val values = lines.asSequence()
             .flatMap { line ->
                 line.replace(",", " ")
                     .split(Regex("\\s+"))
@@ -47,10 +55,16 @@ internal object RuntimeGpuFrequencyProbe {
                 }
                 value?.takeIf { it > 0L }
             }
-            .mapNotNull { value ->
-                runCatching { Math.multiplyExact(value, candidate.multiplierToHz) }.getOrNull()
-            }
             .distinct()
             .toList()
+
+        val multiplier = if (candidate.legacyKhz && (values.maxOrNull() ?: 0L) in 10_000L until 10_000_000L) {
+            1_000L
+        } else {
+            candidate.multiplierToHz
+        }
+        return values.mapNotNull { value ->
+            runCatching { Math.multiplyExact(value, multiplier) }.getOrNull()
+        }
     }
 }

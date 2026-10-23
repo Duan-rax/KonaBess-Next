@@ -10,7 +10,6 @@ import com.ireddragonicy.konabessnext.model.gpu.GpuStabilityUiState
 import com.ireddragonicy.konabessnext.model.gpu.StabilityStatus
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
@@ -58,9 +57,13 @@ class GpuStabilityRepository @Inject constructor(
             "/sys/class/kgsl/kgsl-3d0/devfreq/cur_freq",
             "/sys/class/kgsl/kgsl-3d0/cur_freq",
             "/sys/class/kgsl/kgsl-3d0/gpuclk",
+            "/sys/class/kgsl/kgsl-3d0/clock_mhz",
             "/sys/class/kgsl/kgsl-3d0/clock",
             "/sys/class/kgsl/kgsl-3d0/devfreq/curr_freq",
-        )
+            "${RuntimeGpuFrequencyProbe.CLASS_DEVFREQ_GPU}/cur_freq",
+        ) + RuntimeGpuFrequencyProbe.platformKgslRoots.flatMap { root ->
+            listOf("$root/gpuclk", "$root/clock_mhz")
+        }
         val BUSY_PATHS: List<String> = listOf(
             "/sys/class/kgsl/kgsl-3d0/gpu_busy_percentage",
             "/sys/class/kgsl/kgsl-3d0/busy",
@@ -68,8 +71,8 @@ class GpuStabilityRepository @Inject constructor(
             "/sys/class/kgsl/kgsl-3d0/devfreq/busy",
             "/sys/devices/platform/soc/soc:qcom,kgsl-3d0/devfreq/busy",
             "/sys/devices/platform/soc/*.qcom,kgsl-3d0/devfreq/busy",
-            "/sys/class/devfreq/*/busy",
-        )
+            "${RuntimeGpuFrequencyProbe.CLASS_DEVFREQ_GPU}/busy",
+        ) + RuntimeGpuFrequencyProbe.platformKgslRoots.map { "$it/gpu_busy_percentage" }
         val TEMP_FALLBACK_PATH = "/sys/class/kgsl/kgsl-3d0/temp"
         val THERMAL_ZONE_CMDS: List<String> = listOf(
             "cat /sys/class/thermal/thermal_zone0/temp",
@@ -88,19 +91,15 @@ class GpuStabilityRepository @Inject constructor(
     private data class OriginalLimits(
         val target: GpuFrequencyLockTarget,
         val governor: String?,
-        val minValue: Long?,
-        val maxValue: Long?,
+        val limits: Pair<Long, Long>,
     )
 
     private val _events = MutableSharedFlow<TestEvent>(extraBufferCapacity = 16)
     private val _running = MutableStateFlow(false)
-    private var currentJob: Job? = null
     private var lastSeenRenderError: Int? = null
-    private var originalLimits: OriginalLimits? = null
 
     @Volatile private var resolvedCurFreqPath: String? = null
     @Volatile private var resolvedBusyPath: String? = null
-    @Volatile private var resolvedTempPath: String? = null
     @Volatile private var resolvedTempCommand: String? = null
 
     val events: Flow<TestEvent> = _events.asSharedFlow()
@@ -172,14 +171,19 @@ class GpuStabilityRepository @Inject constructor(
             publish(TestEvent.Failed(FailureReason.DevfreqNodeMissing))
             return@flow
         }
-        val original = readOriginalLimits(lockTarget)
-        originalLimits = original
+        val original = readOriginalLimits(lockTarget) ?: run {
+            publish(TestEvent.Failed(FailureReason.WriteFreqRejected))
+            return@flow
+        }
         _running.value = true
+        var failure: FailureReason? = null
+        val stopped: Boolean
+        val restored: Boolean
         try {
             for (target in candidates) {
                 if (!_running.value) break
                 val pointResult = testFrequency(
-                    lockTarget = lockTarget,
+                    lockTarget = original.target,
                     targetFreqHz = target,
                     durationSec = state.durationPerPointSec,
                     throttleRatioPct = state.throttlingRatioPct,
@@ -187,21 +191,23 @@ class GpuStabilityRepository @Inject constructor(
                 )
                 publish(TestEvent.PointFinished(pointResult))
                 if (!pointResult.passed) {
-                    publish(TestEvent.Failed(reason = pointResult.failureReason ?: FailureReason.Unknown))
+                    failure = pointResult.failureReason ?: FailureReason.Unknown
                     break
                 }
             }
-            if (_running.value) {
-                publish(TestEvent.AllCompleted)
-            }
-        } catch (ce: CancellationException) {
-            publish(TestEvent.Aborted)
-            throw ce
+            stopped = !_running.value
         } finally {
+            restored = withContext(NonCancellable) { restoreLimits(original) }
             _running.value = false
-            withContext(NonCancellable) { restoreLimits(original) }
-            originalLimits = null
         }
+        publish(
+            when {
+                !restored -> TestEvent.Failed(FailureReason.WriteFreqRejected)
+                stopped -> TestEvent.Aborted
+                failure != null -> TestEvent.Failed(failure)
+                else -> TestEvent.AllCompleted
+            },
+        )
     }.flowOn(Dispatchers.IO)
 
     /**
@@ -221,7 +227,6 @@ class GpuStabilityRepository @Inject constructor(
             runCatching { _events.emit(event) }
             this@flow.emit(event)
         }
-        originalLimits = null
         _running.value = true
         try {
             while (_running.value) {
@@ -256,13 +261,6 @@ class GpuStabilityRepository @Inject constructor(
      */
     suspend fun cancelTest() = withContext(Dispatchers.IO) {
         _running.value = false
-        currentJob?.cancel()
-        currentJob = null
-        val orig = originalLimits
-        if (orig != null) {
-            restoreLimits(orig)
-        }
-        originalLimits = null
     }
 
     /**
@@ -291,7 +289,7 @@ class GpuStabilityRepository @Inject constructor(
             requestedMax = targetValue,
         )
         if (commands.isEmpty() && current != (targetValue to targetValue)) return@withContext false
-        if (commands.isNotEmpty() && !shellExecutor.execAndCheck(*commands.toTypedArray())) {
+        if (commands.isNotEmpty() && !shellExecutor.execAndCheck(commands.joinToString(" && "))) {
             return@withContext false
         }
 
@@ -303,13 +301,12 @@ class GpuStabilityRepository @Inject constructor(
      * `NonCancellable` context, even when the sweep is cancelled, so we don't leave
      * the GPU pinned to a single frequency.
      */
-    private suspend fun restoreLimits(original: OriginalLimits) = withContext(Dispatchers.IO) {
-        if (!shellExecutor.isRootMode) return@withContext
+    private suspend fun restoreLimits(original: OriginalLimits): Boolean {
+        if (!shellExecutor.isRootMode) return false
         try {
-            val requestedMin = original.minValue
-            val requestedMax = original.maxValue
+            val (requestedMin, requestedMax) = original.limits
             val current = readRawLimits(original.target)
-            if (requestedMin != null && requestedMax != null && current != null) {
+            if (current != null) {
                 val commands = RuntimeGpuFrequencyLock.buildTransitionCommands(
                     target = original.target,
                     currentMin = current.first,
@@ -317,16 +314,22 @@ class GpuStabilityRepository @Inject constructor(
                     requestedMin = requestedMin,
                     requestedMax = requestedMax,
                 )
-                if (commands.isNotEmpty()) shellExecutor.execAndCheck(*commands.toTypedArray())
+                if (commands.isNotEmpty()) shellExecutor.execAndCheck(commands.joinToString(" && "))
             }
             val governorPath = original.target.governorPath
-            if (governorPath != null) {
-                original.governor?.let {
-                    shellExecutor.execAndCheck("echo '$it' > '$governorPath'")
+            val governor = original.governor
+            val governorRestored = if (governorPath != null && governor != null) {
+                if (readGovernor(governorPath) != governor) {
+                    shellExecutor.execAndCheck("echo '$governor' > '$governorPath'")
                 }
+                readGovernor(governorPath) == governor
+            } else {
+                true
             }
+            return governorRestored && readRawLimits(original.target) == original.limits
         } catch (e: Exception) {
             Log.w(TAG, "restoreLimits failed: ${e.message}")
+            return false
         }
     }
 
@@ -414,25 +417,16 @@ class GpuStabilityRepository @Inject constructor(
             ?.also { resolvedCurFreqPath = it }
         val busyPath = resolvedBusyPath ?: resolveFirstWorkingPath(BUSY_PATHS, asLong = false)
             ?.also { resolvedBusyPath = it }
-        val tempPath = resolvedTempPath
         val tempCmd = resolvedTempCommand ?: pickTemperatureCommand()?.also { resolvedTempCommand = it }
-        val sb = StringBuilder()
-        sb.append("cat '").append(curFreqPath ?: "/dev/null").append("' 2>/dev/null; ")
-        if (busyPath != null) {
-            sb.append("cat '").append(busyPath).append("' 2>/dev/null; ")
-        } else {
-            // busy path unknown → emit a placeholder so the row index of
-            // the temperature sample below stays stable across reads.
-            sb.append("echo 0; ")
-        }
-        if (tempPath != null) {
-            sb.append("cat '").append(tempPath).append("' 2>/dev/null; ")
-        } else if (tempCmd != null) {
-            sb.append(tempCmd).append(" 2>/dev/null; ")
-        }
-        val raw = shellExecutor.execForOutput(sb.toString())
+        // Keep the three fields aligned when a node is unreadable or absent.
+        val raw = shellExecutor.execForOutput(
+            listOf(curFreqPath?.let { "cat '$it'" }, busyPath?.let { "cat '$it'" }, tempCmd)
+                .joinToString("; ") { command ->
+                    if (command == null) "echo unavailable" else "$command 2>/dev/null || echo unavailable"
+                },
+        )
 
-        val curFreq = raw.getOrNull(0)?.trim()?.toLongOrNull()?.takeIf { it > 0L } ?: 0L
+        val curFreq = parseCurrentGpuFrequencyHz(raw.getOrNull(0), curFreqPath)
         val busy = parsePercentInt(raw.getOrNull(1)?.trim())
         val tempRaw = raw.getOrNull(2)?.trim()?.toLongOrNull()
         val temp = if (tempRaw != null && tempRaw > 0L) {
@@ -451,14 +445,19 @@ class GpuStabilityRepository @Inject constructor(
     }
 
     private suspend fun resolveFirstWorkingPath(paths: List<String>, asLong: Boolean): String? {
-        for (path in paths) {
-            val cmd = if (path.contains('*'))
-                "cat $path 2>/dev/null" else "cat '$path' 2>/dev/null"
-            val raw = shellExecutor.execForOutput(cmd).firstOrNull()?.trim()
-            if (asLong) {
-                if (raw?.toLongOrNull()?.let { it > 0L } == true) return path
+        for (pattern in paths) {
+            val candidates = if (pattern.contains('*')) {
+                shellExecutor.execForOutput(
+                    "for f in $pattern; do [ -r \"${'$'}f\" ] && printf '%s\\n' \"${'$'}f\"; done"
+                )
             } else {
-                if (parsePercentInt(raw)?.let { it in 0..100 } == true) return path
+                listOf(pattern)
+            }
+            for (path in candidates) {
+                val raw = shellExecutor.execForOutput("cat '$path' 2>/dev/null").firstOrNull()
+                val readable = if (asLong) parseCurrentGpuFrequencyHz(raw, path) > 0L
+                    else parsePercentInt(raw) != null
+                if (readable) return path
             }
         }
         return null
@@ -467,13 +466,7 @@ class GpuStabilityRepository @Inject constructor(
     /** Pick the first working temperature path. Kept separate from [resolveFirstWorkingPath]
      *  because TEMP_FALLBACK_PATH is a fixed path and THERMAL_ZONE_CMDS are shell commands. */
     private suspend fun pickTemperatureCommand(): String? {
-        val direct = shellExecutor.execForOutput("cat '$TEMP_FALLBACK_PATH' 2>/dev/null")
-            .firstOrNull()?.trim()?.toLongOrNull()
-        if (direct != null && direct > 0L) {
-            resolvedTempPath = TEMP_FALLBACK_PATH
-            return null  // resolvedTempPath handles it from here
-        }
-        for (cmd in THERMAL_ZONE_CMDS) {
+        for (cmd in listOf("cat '$TEMP_FALLBACK_PATH'") + THERMAL_ZONE_CMDS) {
             val value = shellExecutor.execForOutput("$cmd 2>/dev/null").firstOrNull()?.trim()?.toLongOrNull()
             if (value != null && value > 0L) return cmd
         }
@@ -492,16 +485,17 @@ class GpuStabilityRepository @Inject constructor(
         }
     }
 
-    private suspend fun readOriginalLimits(target: GpuFrequencyLockTarget): OriginalLimits = withContext(Dispatchers.IO) {
-        val limits = readRawLimits(target)
-        OriginalLimits(
-            target = target,
-            governor = target.governorPath?.let { path ->
-                shellExecutor.execForOutput("cat '$path'")
-                    .firstOrNull()?.trim()?.ifEmpty { null }
-            },
-            minValue = limits?.first,
-            maxValue = limits?.second,
+    private suspend fun readGovernor(path: String): String? =
+        shellExecutor.execForOutput("cat '$path'").firstOrNull()?.trim()
+            ?.takeIf { it.matches(Regex("[a-zA-Z0-9_-]+")) }
+
+    private suspend fun readOriginalLimits(target: GpuFrequencyLockTarget): OriginalLimits? {
+        val limits = readRawLimits(target) ?: return null
+        val governor = target.governorPath?.let { readGovernor(it) }
+        return OriginalLimits(
+            target = if (governor == null) target.copy(governorPath = null) else target,
+            governor = governor,
+            limits = limits,
         )
     }
 
@@ -514,6 +508,16 @@ class GpuStabilityRepository @Inject constructor(
         data class Failed(val reason: FailureReason) : TestEvent()
         data object AllCompleted : TestEvent()
         data object Aborted : TestEvent()
+    }
+}
+
+internal fun parseCurrentGpuFrequencyHz(raw: String?, path: String?): Long {
+    val value = raw?.trim()?.toLongOrNull()?.takeIf { it > 0L } ?: return 0L
+    return when {
+        path?.endsWith("/clock_mhz") == true ->
+            runCatching { Math.multiplyExact(value, 1_000_000L) }.getOrDefault(0L)
+        path?.endsWith("/gpuclk") != true && value in 10_000L until 10_000_000L -> value * 1_000L
+        else -> value
     }
 }
 

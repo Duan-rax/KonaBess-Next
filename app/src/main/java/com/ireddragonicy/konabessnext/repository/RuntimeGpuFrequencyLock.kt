@@ -27,6 +27,7 @@ internal object RuntimeGpuFrequencyLock {
      */
     val devfreqBasePatterns: List<String> = listOf(
         "$KGSL_ROOT/devfreq",
+        "${RuntimeGpuFrequencyProbe.CLASS_DEVFREQ_GPU}",
         "/sys/devices/platform/soc/soc:qcom,kgsl-3d0/devfreq",
         "/sys/devices/platform/soc/*.qcom,kgsl-3d0/devfreq",
         "/sys/devices/platform/soc/*.qcom,kgsl-3d0/devfreq/*",
