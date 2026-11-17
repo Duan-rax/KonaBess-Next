@@ -3,7 +3,7 @@ package com.ireddragonicy.konabessnext.repository
 import com.ireddragonicy.konabessnext.model.gpu.FailureReason
 import com.ireddragonicy.konabessnext.model.gpu.GpuStabilityUiState
 import kotlinx.coroutines.flow.toList
-import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Test
@@ -80,7 +80,7 @@ class RuntimeGpuFrequencyLockTest {
     }
 
     @Test
-    fun `resolver ignores empty devfreq shells and falls back to KGSL MHz controls`() = runTest {
+    fun `resolver ignores empty devfreq shells and falls back to KGSL MHz controls`() = runBlocking {
         val shell = object : ShellExecutor {
             override val isRootMode: Boolean = true
 
@@ -102,7 +102,7 @@ class RuntimeGpuFrequencyLockTest {
     }
 
     @Test
-    fun `a rejected second write restores the first write before reporting failure`() = runTest {
+    fun `a rejected second write restores the first write before reporting failure`() = runBlocking {
         var min = 160L
         var max = 1_200L
         val shell = object : ShellExecutor {

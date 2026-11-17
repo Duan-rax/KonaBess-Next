@@ -93,8 +93,6 @@ class DeviceRepositoryTest {
         // Given
         val testDir = File("build/tmp/test_files")
         testDir.mkdirs()
-        val bootNew = File(testDir, "boot_new.img")
-        bootNew.writeBytes(ByteArray(1024)) // 1024 bytes
         
         every { fileDataSource.getFilesDir() } returns testDir
         // Mock system properties to resolve partition path
@@ -111,6 +109,9 @@ class DeviceRepositoryTest {
         // First we must ensure bootName is set.
         val getBootResult = deviceRepository.getBootImage()
         assertTrue(getBootResult is DomainResult.Success)
+        val bootNew = File(testDir, "partitions/vendor_boot/boot_new.img")
+        bootNew.parentFile?.mkdirs()
+        bootNew.writeBytes(ByteArray(1024))
 
         // When
         val writeResult = deviceRepository.writeBootImage()
