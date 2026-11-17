@@ -48,12 +48,19 @@ internal object RuntimeGpuFrequencyLock {
             maxPath = "$KGSL_ROOT/max_clock_mhz",
             hzPerUnit = 1_000_000L,
         ),
+        // KGSL also exports its MHz controls through a separate sysfs interface.
+        GpuFrequencyLockTarget(
+            minPath = "/sys/kernel/gpu/gpu_min_clock",
+            maxPath = "/sys/kernel/gpu/gpu_max_clock",
+            hzPerUnit = 1_000_000L,
+        ),
     )
 
     suspend fun resolve(shellExecutor: ShellExecutor): GpuFrequencyLockTarget? {
         for (pattern in devfreqBasePatterns) {
             val command = "for d in $pattern; do " +
                 "[ -e \"${'$'}d/min_freq\" ] && [ -e \"${'$'}d/max_freq\" ] && " +
+                "( : >> \"${'$'}d/min_freq\" && : >> \"${'$'}d/max_freq\" ) 2>/dev/null && " +
                 "{ echo \"${'$'}d\"; break; }; done"
             val basePath = runCatching { shellExecutor.execForOutput(command) }
                 .getOrNull()
@@ -71,9 +78,12 @@ internal object RuntimeGpuFrequencyLock {
             )
         }
 
+        // Open each control for writing without sending any data. A root
+        // access check (-w) can succeed even if sysfs refuses the actual open.
         return directTargets.firstOrNull { target ->
             shellExecutor.execAndCheck(
-                "[ -e '${target.minPath}' ] && [ -e '${target.maxPath}' ]"
+                "[ -e '${target.minPath}' ] && [ -e '${target.maxPath}' ] && " +
+                    "( : >> '${target.minPath}' && : >> '${target.maxPath}' ) 2>/dev/null"
             )
         }
     }

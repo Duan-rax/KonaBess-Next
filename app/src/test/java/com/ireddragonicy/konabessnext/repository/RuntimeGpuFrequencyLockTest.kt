@@ -102,6 +102,31 @@ class RuntimeGpuFrequencyLockTest {
     }
 
     @Test
+    fun `resolver skips read-only controls and selects the KGSL compatibility interface`() = runBlocking {
+        val shell = object : ShellExecutor {
+            override val isRootMode = true
+
+            override suspend fun execForOutput(vararg commands: String): List<String> = emptyList()
+
+            override suspend fun execAndCheck(vararg commands: String): Boolean {
+                val command = commands.single()
+                if ("min_clock_mhz" in command && ": >>" !in command) return true
+                return ": >> '/sys/kernel/gpu/gpu_min_clock'" in command &&
+                    ": >> '/sys/kernel/gpu/gpu_max_clock'" in command
+            }
+        }
+
+        assertEquals(
+            GpuFrequencyLockTarget(
+                minPath = "/sys/kernel/gpu/gpu_min_clock",
+                maxPath = "/sys/kernel/gpu/gpu_max_clock",
+                hzPerUnit = 1_000_000L,
+            ),
+            RuntimeGpuFrequencyLock.resolve(shell),
+        )
+    }
+
+    @Test
     fun `a partial lock is rolled back after a transient inconsistent read`() = runBlocking {
         val shell = PartialLockShell(allowRestore = true)
         val events = runPartialLockTest(shell)
