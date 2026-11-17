@@ -129,7 +129,7 @@ jobs:
               if [[ "$filename" == *"arm64-v8a"* ]]; then abi="arm64-v8a"; fi
               if [[ "$filename" == *"armeabi-v7a"* ]]; then abi="armeabi-v7a"; fi
               if [[ "$filename" == *"x86_64"* ]]; then abi="x86_64"; fi
-              if [[ "$filename" == *"x86"* ]]; then abi="x86"; fi
+              if [[ "$filename" == *"x86"* && "$filename" != *"x86_64"* ]]; then abi="x86"; fi
               
               new_name="KonaBessNext-v${VERSION}-${abi}-${type}.apk"
               mv "$file" "$(dirname "$file")/$new_name"
@@ -221,7 +221,6 @@ jobs:
           >
           > **Critical Notice**:
           > * Experimental features may not function as intended.
-          > * Please immediately report any issues on the [GitHub Repository](https://github.com/KonaBess-Next/KonaBess-Next/issues).
 
           ## Build Information
           
