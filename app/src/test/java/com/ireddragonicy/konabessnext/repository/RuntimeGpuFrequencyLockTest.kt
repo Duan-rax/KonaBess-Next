@@ -1,5 +1,8 @@
 package com.ireddragonicy.konabessnext.repository
 
+import com.ireddragonicy.konabessnext.model.gpu.FailureReason
+import com.ireddragonicy.konabessnext.model.gpu.GpuStabilityUiState
+import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
@@ -96,5 +99,39 @@ class RuntimeGpuFrequencyLockTest {
             ),
             RuntimeGpuFrequencyLock.resolve(shell),
         )
+    }
+
+    @Test
+    fun `a rejected second write restores the first write before reporting failure`() = runTest {
+        var min = 160L
+        var max = 1_200L
+        val shell = object : ShellExecutor {
+            override val isRootMode = true
+
+            override suspend fun execForOutput(vararg commands: String): List<String> = when {
+                commands.single().startsWith("cat") && "/min_clock_mhz" in commands.single() -> listOf(min.toString())
+                commands.single().startsWith("cat") && "/max_clock_mhz" in commands.single() -> listOf(max.toString())
+                else -> emptyList()
+            }
+
+            override suspend fun execAndCheck(vararg commands: String): Boolean {
+                val command = commands.single()
+                if (command.startsWith("[")) return "min_clock_mhz" in command
+                for (write in command.split(" && ")) {
+                    val value = write.split(' ')[1].toLong()
+                    if ("/min_clock_mhz" in write) min = value
+                    else return false
+                }
+                return true
+            }
+        }
+        val events = GpuStabilityRepository(shell).runStabilityTest(
+            GpuStabilityUiState(activeFrequenciesHz = listOf(191_000_000L), durationPerPointSec = 0),
+        ).toList()
+
+        assertEquals(160L, min)
+        assertEquals(1_200L, max)
+        assertEquals(2, events.size)
+        assertEquals(GpuStabilityRepository.TestEvent.Failed(FailureReason.WriteFreqRejected), events.last())
     }
 }

@@ -1,6 +1,5 @@
 package com.ireddragonicy.konabessnext.repository
 
-import com.ireddragonicy.konabessnext.repository.HistoryManager.LineDiff
 import org.junit.Assert.assertEquals
 import org.junit.Test
 

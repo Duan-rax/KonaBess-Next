@@ -1,10 +1,14 @@
 package com.ireddragonicy.konabessnext.repository
 
 import com.ireddragonicy.konabessnext.core.interfaces.FileDataSource
+import com.ireddragonicy.konabessnext.core.model.DomainResult
 import com.ireddragonicy.konabessnext.domain.DdrDomainManager
 import com.ireddragonicy.konabessnext.model.ChipDefinition
+import com.ireddragonicy.konabessnext.model.Dtb
+import com.ireddragonicy.konabessnext.model.TargetPartition
 import com.ireddragonicy.konabessnext.model.dts.DtsNode
 import com.ireddragonicy.konabessnext.utils.DtsTreeHelper
+import io.mockk.mockk
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -47,7 +51,19 @@ class GpuRepositoryTest {
         historyManager = HistoryManager()
         userMessageManager = com.ireddragonicy.konabessnext.utils.UserMessageManager() // Real instance logic is simple enough
         
-        repository = GpuRepository(dtsFileRepository, gpuDomainManager, ddrDomainManager, historyManager, fakeChipRepository, userMessageManager)
+        repository = GpuRepository(
+            dtsFileRepository = dtsFileRepository,
+            gpuDomainManager = gpuDomainManager,
+            ddrDomainManager = ddrDomainManager,
+            ufsDomainManager = mockk(relaxed = true),
+            gmuDomainManager = mockk(relaxed = true),
+            camIspDomainManager = mockk(relaxed = true),
+            sdeDomainManager = mockk(relaxed = true),
+            rpmhDomainManager = mockk(relaxed = true),
+            historyManager = historyManager,
+            chipRepository = fakeChipRepository,
+            userMessageManager = userMessageManager,
+        )
     }
 
     @After
@@ -298,7 +314,6 @@ class FakeChipRepository : ChipRepositoryInterface {
     private val _currentChip = MutableStateFlow<ChipDefinition?>(null)
     override val currentChip: StateFlow<ChipDefinition?> = _currentChip.asStateFlow()
 
-    override fun loadDefinitions() {}
     override fun setCurrentChip(chip: ChipDefinition?) { _currentChip.value = chip }
     override fun getChipById(id: String): ChipDefinition? = null
     override fun getLevelsForCurrentChip(): IntArray = IntArray(0)
@@ -307,9 +322,18 @@ class FakeChipRepository : ChipRepositoryInterface {
 
 class FakeDeviceRepository : DeviceRepositoryInterface {
     override var dtsPath: String? = "fake_path.dts"
+    private val partition = MutableStateFlow(TargetPartition.VENDOR_BOOT)
+    override val selectedPartition: TargetPartition get() = partition.value
+    override val selectedPartitionFlow: StateFlow<TargetPartition> = partition.asStateFlow()
+    override val availablePartitions: List<TargetPartition> = listOf(TargetPartition.VENDOR_BOOT)
     override fun tryRestoreLastChipset(): Boolean = false
     override fun getDtsFile(): File = File("fake_path.dts")
-    override suspend fun getRunTimeGpuFrequencies(): List<Long> = emptyList()
+    override fun setSelectedPartition(partition: TargetPartition) { this.partition.value = partition }
+    override fun getDtbs(partition: TargetPartition): List<Dtb> = emptyList()
+    override suspend fun loadPartitionDtbs(partition: TargetPartition): DomainResult<List<Dtb>> =
+        DomainResult.Success(emptyList())
+    override fun getActiveDtbId(partition: TargetPartition): Int = -1
+    override suspend fun getRunTimeGpuFrequencies(): DomainResult<List<Long>> = DomainResult.Success(emptyList())
 }
 
 class FakeFileDataSource : FileDataSource {
