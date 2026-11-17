@@ -106,18 +106,25 @@ class GpuStabilityViewModel @Inject constructor(
         }
     }
 
-    private suspend fun refreshFrequenciesInternal() {
+    private suspend fun refreshFrequenciesInternal(preserveSelection: Boolean = false) {
         val result = stabilityRepository.loadActiveFrequencies()
         _uiState.update { current ->
+            if (preserveSelection && current.status == StabilityStatus.Running) return@update current
             when (result) {
-                is DomainResult.Success -> current.copy(
-                    activeFrequenciesHz = result.data,
-                    // Auto-select every freshly probed frequency so the
-                    // existing "sweep-all" UX is preserved until the user
-                    // explicitly deselects something in the picker dialog.
-                    selectedFrequenciesHz = result.data.toSet(),
-                    failureMessage = null,
-                )
+                is DomainResult.Success -> {
+                    val available = result.data.toSet()
+                    val hadCustomSelection =
+                        current.selectedFrequenciesHz != current.activeFrequenciesHz.toSet()
+                    current.copy(
+                        activeFrequenciesHz = result.data,
+                        selectedFrequenciesHz = if (preserveSelection && hadCustomSelection) {
+                            current.selectedFrequenciesHz.intersect(available)
+                        } else {
+                            available
+                        },
+                        failureMessage = null,
+                    )
+                }
                 is DomainResult.Failure -> current.copy(
                     activeFrequenciesHz = emptyList(),
                     selectedFrequenciesHz = emptySet(),
@@ -184,7 +191,8 @@ class GpuStabilityViewModel @Inject constructor(
             val fresh = _uiState.value
             if (fresh.status != StabilityStatus.Running) {
                 if (fresh.isRootPinningCapable) {
-                    startPinningTest()
+                    refreshFrequenciesInternal(preserveSelection = true)
+                    if (_uiState.value.status != StabilityStatus.Running) startPinningTest()
                 } else {
                     startFreeRunTest()
                 }
@@ -217,16 +225,7 @@ class GpuStabilityViewModel @Inject constructor(
 
     private fun startPinningTest() {
         val snapshot = _uiState.value
-        // Honour the user's frequency selection. If they've explicitly
-        // cleared the picker but there are still active frequencies, treat
-        // this the same as "nothing to test" — refuse rather than silently
-        // sweeping the full set.
-        val candidates: List<Long> = when {
-            snapshot.selectedFrequenciesHz.isNotEmpty() ->
-                snapshot.activeFrequenciesHz.filter { it in snapshot.selectedFrequenciesHz }
-            snapshot.activeFrequenciesHz.isEmpty() -> emptyList()
-            else -> snapshot.activeFrequenciesHz
-        }
+        val candidates = snapshot.activeFrequenciesHz.filter { it in snapshot.selectedFrequenciesHz }
         if (candidates.isEmpty()) {
             _uiState.update { it.copy(failureReason = FailureReason.NoFrequencies) }
             return

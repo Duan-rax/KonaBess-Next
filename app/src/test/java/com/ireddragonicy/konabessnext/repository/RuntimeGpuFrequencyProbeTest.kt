@@ -25,10 +25,11 @@ class RuntimeGpuFrequencyProbeTest {
     @Test
     fun `MHz fallback is converted to Hz`() {
         val candidates = RuntimeGpuFrequencyProbe.candidates.filter {
-            it.command.endsWith("/freq_table_mhz")
+            it.command.endsWith("/freq_table_mhz") ||
+                it.command == "cat /sys/kernel/gpu/gpu_freq_table"
         }
 
-        assertTrue(candidates.size > 1)
+        assertTrue(candidates.any { it.command == "cat /sys/kernel/gpu/gpu_freq_table" })
         for (candidate in candidates) {
             assertEquals(
                 listOf(1_200_000_000L, 902_000_000L, 160_000_000L),

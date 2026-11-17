@@ -34,7 +34,8 @@ internal object RuntimeGpuFrequencyProbe {
             Candidate("cat $root/available_frequencies", legacyKhz = true),
         )
     } + listOf(Candidate("cat /sys/class/kgsl/kgsl-3d0/freq_table_mhz", 1_000_000L)) +
-        platformKgslRoots.map { Candidate("cat $it/freq_table_mhz", 1_000_000L) }
+        platformKgslRoots.map { Candidate("cat $it/freq_table_mhz", 1_000_000L) } +
+        Candidate("cat /sys/kernel/gpu/gpu_freq_table", 1_000_000L)
 
     fun parse(lines: List<String>, candidate: Candidate): List<Long> {
         if (lines.isEmpty()) return emptyList()
