@@ -26,7 +26,7 @@ import javax.inject.Singleton
 /**
  * Owns the runtime side of the GPU stability test:
  *  - reads the kernel-reported GPU frequency list (used as the candidate set);
- *  - pins the GPU to a single clock by writing min_freq == max_freq under root;
+ *  - pins the GPU to a single clock using the available devfreq or KGSL controls;
  *  - samples cur_freq / busy / temperature at ~1 Hz while the renderer is active;
  *  - restores the original governor/min/max on completion, abort or failure.
  *
@@ -49,12 +49,8 @@ class GpuStabilityRepository @Inject constructor(
         /** Sysfs paths probed for the active Adreno frequency table. */
         val PROBE_COMMANDS: List<String> = RuntimeGpuFrequencyProbe.candidates.map { it.command }
 
-        /** sysfs paths for the per-frequency governor / min / max knobs. */
-        val GOV_NODE_CANDIDATES: List<String> = listOf(
-            "/sys/class/kgsl/kgsl-3d0/devfreq",
-            "/sys/devices/platform/soc/soc:qcom,kgsl-3d0/devfreq",
-            "/sys/devices/platform/soc/*.qcom,kgsl-3d0/devfreq",
-        )
+        /** Kept public for diagnostics and compatibility with existing callers. */
+        val GOV_NODE_CANDIDATES: List<String> = RuntimeGpuFrequencyLock.devfreqBasePatterns
 
         /** Cat paths used to read GPU samples. We try a list of candidate paths
          *  because different kernels expose them in slightly different places. */
@@ -90,10 +86,10 @@ class GpuStabilityRepository @Inject constructor(
 
     /** Snapshot of the values we overwrote, used to restore on stop. */
     private data class OriginalLimits(
+        val target: GpuFrequencyLockTarget,
         val governor: String?,
-        val minFreqHz: Long?,
-        val maxFreqHz: Long?,
-        val nodeDir: String?,
+        val minValue: Long?,
+        val maxValue: Long?,
     )
 
     private val _events = MutableSharedFlow<TestEvent>(extraBufferCapacity = 16)
@@ -172,18 +168,18 @@ class GpuStabilityRepository @Inject constructor(
             publish(TestEvent.Failed(FailureReason.NoFrequencies))
             return@flow
         }
-        val nodeDir = resolveGovernorNode() ?: run {
+        val lockTarget = RuntimeGpuFrequencyLock.resolve(shellExecutor) ?: run {
             publish(TestEvent.Failed(FailureReason.DevfreqNodeMissing))
             return@flow
         }
-        val original = readOriginalLimits(nodeDir)
+        val original = readOriginalLimits(lockTarget)
         originalLimits = original
         _running.value = true
         try {
             for (target in candidates) {
                 if (!_running.value) break
                 val pointResult = testFrequency(
-                    nodeDir = nodeDir,
+                    lockTarget = lockTarget,
                     targetFreqHz = target,
                     durationSec = state.durationPerPointSec,
                     throttleRatioPct = state.throttlingRatioPct,
@@ -203,7 +199,7 @@ class GpuStabilityRepository @Inject constructor(
             throw ce
         } finally {
             _running.value = false
-            withContext(NonCancellable) { restoreLimits(original, nodeDir) }
+            withContext(NonCancellable) { restoreLimits(original) }
             originalLimits = null
         }
     }.flowOn(Dispatchers.IO)
@@ -263,9 +259,8 @@ class GpuStabilityRepository @Inject constructor(
         currentJob?.cancel()
         currentJob = null
         val orig = originalLimits
-        val nodeDir = orig?.nodeDir ?: resolveGovernorNode()
-        if (orig != null && nodeDir != null) {
-            restoreLimits(orig, nodeDir)
+        if (orig != null) {
+            restoreLimits(orig)
         }
         originalLimits = null
     }
@@ -274,13 +269,33 @@ class GpuStabilityRepository @Inject constructor(
      * Try to lock the GPU at [targetFreqHz]. Returns true on success. Used by callers
      * (and tests) that want to drive a single frequency manually.
      */
-    suspend fun pinFrequency(nodeDir: String, targetFreqHz: Long): Boolean = withContext(Dispatchers.IO) {
+    internal suspend fun pinFrequency(
+        lockTarget: GpuFrequencyLockTarget,
+        targetFreqHz: Long,
+    ): Boolean = withContext(Dispatchers.IO) {
         if (!shellExecutor.isRootMode) return@withContext false
-        shellExecutor.execAndCheck(
-            "echo performance > $nodeDir/governor",
-            "echo $targetFreqHz > $nodeDir/min_freq",
-            "echo $targetFreqHz > $nodeDir/max_freq",
+        val targetValue = lockTarget.rawValueForHz(targetFreqHz) ?: return@withContext false
+        val current = readRawLimits(lockTarget) ?: return@withContext false
+
+        // Min == max is sufficient to pin devfreq. Switching governor is a
+        // best-effort optimization because several vendor kernels expose a
+        // read-only or restricted governor while still allowing range writes.
+        lockTarget.governorPath?.let {
+            runCatching { shellExecutor.execAndCheck("echo performance > '$it'") }
+        }
+        val commands = RuntimeGpuFrequencyLock.buildTransitionCommands(
+            target = lockTarget,
+            currentMin = current.first,
+            currentMax = current.second,
+            requestedMin = targetValue,
+            requestedMax = targetValue,
         )
+        if (commands.isEmpty() && current != (targetValue to targetValue)) return@withContext false
+        if (commands.isNotEmpty() && !shellExecutor.execAndCheck(*commands.toTypedArray())) {
+            return@withContext false
+        }
+
+        readRawLimits(lockTarget) == (targetValue to targetValue)
     }
 
     /**
@@ -288,25 +303,41 @@ class GpuStabilityRepository @Inject constructor(
      * `NonCancellable` context, even when the sweep is cancelled, so we don't leave
      * the GPU pinned to a single frequency.
      */
-    private suspend fun restoreLimits(original: OriginalLimits, nodeDir: String) = withContext(Dispatchers.IO) {
+    private suspend fun restoreLimits(original: OriginalLimits) = withContext(Dispatchers.IO) {
         if (!shellExecutor.isRootMode) return@withContext
         try {
-            original.minFreqHz?.let { shellExecutor.execAndCheck("echo $it > $nodeDir/min_freq") }
-            original.maxFreqHz?.let { shellExecutor.execAndCheck("echo $it > $nodeDir/max_freq") }
-            original.governor?.let { shellExecutor.execAndCheck("echo '$it' > $nodeDir/governor") }
+            val requestedMin = original.minValue
+            val requestedMax = original.maxValue
+            val current = readRawLimits(original.target)
+            if (requestedMin != null && requestedMax != null && current != null) {
+                val commands = RuntimeGpuFrequencyLock.buildTransitionCommands(
+                    target = original.target,
+                    currentMin = current.first,
+                    currentMax = current.second,
+                    requestedMin = requestedMin,
+                    requestedMax = requestedMax,
+                )
+                if (commands.isNotEmpty()) shellExecutor.execAndCheck(*commands.toTypedArray())
+            }
+            val governorPath = original.target.governorPath
+            if (governorPath != null) {
+                original.governor?.let {
+                    shellExecutor.execAndCheck("echo '$it' > '$governorPath'")
+                }
+            }
         } catch (e: Exception) {
             Log.w(TAG, "restoreLimits failed: ${e.message}")
         }
     }
 
     private suspend fun testFrequency(
-        nodeDir: String,
+        lockTarget: GpuFrequencyLockTarget,
         targetFreqHz: Long,
         durationSec: Int,
         throttleRatioPct: Int,
         onSample: suspend (GpuSample) -> Unit = {},
     ): FreqPointResult {
-        val pinned = pinFrequency(nodeDir, targetFreqHz)
+        val pinned = pinFrequency(lockTarget, targetFreqHz)
         if (!pinned) {
             return FreqPointResult(
                 targetFreqHz = targetFreqHz,
@@ -449,28 +480,28 @@ class GpuStabilityRepository @Inject constructor(
         return null
     }
 
-    private suspend fun resolveGovernorNode(): String? {
-        for (candidate in GOV_NODE_CANDIDATES) {
-            if (candidate.contains('*')) {
-                // glob, only valid through shell — use `ls` style probe
-                val out = shellExecutor.execForOutput("ls -d $candidate 2>/dev/null").firstOrNull()
-                if (!out.isNullOrBlank()) return out.trim()
-            } else if (shellExecutor.execAndCheck("[ -d '$candidate' ]")) {
-                return candidate
-            }
+    private suspend fun readRawLimits(target: GpuFrequencyLockTarget): Pair<Long, Long>? {
+        val minValue = shellExecutor.execForOutput("cat '${target.minPath}'")
+            .firstOrNull()?.trim()?.toLongOrNull()
+        val maxValue = shellExecutor.execForOutput("cat '${target.maxPath}'")
+            .firstOrNull()?.trim()?.toLongOrNull()
+        return if (minValue != null && maxValue != null && minValue > 0L && minValue <= maxValue) {
+            minValue to maxValue
+        } else {
+            null
         }
-        return null
     }
 
-    private suspend fun readOriginalLimits(nodeDir: String): OriginalLimits = withContext(Dispatchers.IO) {
+    private suspend fun readOriginalLimits(target: GpuFrequencyLockTarget): OriginalLimits = withContext(Dispatchers.IO) {
+        val limits = readRawLimits(target)
         OriginalLimits(
-            governor = shellExecutor.execForOutput("cat $nodeDir/governor")
-                .firstOrNull()?.trim()?.ifEmpty { null },
-            minFreqHz = shellExecutor.execForOutput("cat $nodeDir/min_freq")
-                .firstOrNull()?.trim()?.toLongOrNull(),
-            maxFreqHz = shellExecutor.execForOutput("cat $nodeDir/max_freq")
-                .firstOrNull()?.trim()?.toLongOrNull(),
-            nodeDir = nodeDir,
+            target = target,
+            governor = target.governorPath?.let { path ->
+                shellExecutor.execForOutput("cat '$path'")
+                    .firstOrNull()?.trim()?.ifEmpty { null }
+            },
+            minValue = limits?.first,
+            maxValue = limits?.second,
         )
     }
 
