@@ -102,36 +102,71 @@ class RuntimeGpuFrequencyLockTest {
     }
 
     @Test
-    fun `a rejected second write restores the first write before reporting failure`() = runBlocking {
-        var min = 160L
-        var max = 1_200L
-        val shell = object : ShellExecutor {
-            override val isRootMode = true
+    fun `a partial lock is rolled back after a transient inconsistent read`() = runBlocking {
+        val shell = PartialLockShell(allowRestore = true)
+        val events = runPartialLockTest(shell)
 
-            override suspend fun execForOutput(vararg commands: String): List<String> = when {
-                commands.single().startsWith("cat") && "/min_clock_mhz" in commands.single() -> listOf(min.toString())
-                commands.single().startsWith("cat") && "/max_clock_mhz" in commands.single() -> listOf(max.toString())
-                else -> emptyList()
-            }
+        assertEquals(160L, shell.min)
+        assertEquals(1_200L, shell.max)
+        assertEquals(1, shell.restoreWrites)
+        assertEquals(2, events.size)
+        assertEquals(GpuStabilityRepository.TestEvent.Failed(FailureReason.WriteFreqRejected), events.last())
+    }
 
-            override suspend fun execAndCheck(vararg commands: String): Boolean {
-                val command = commands.single()
-                if (command.startsWith("[")) return "min_clock_mhz" in command
-                for (write in command.split(" && ")) {
-                    val value = write.split(' ')[1].toLong()
-                    if ("/min_clock_mhz" in write) min = value
-                    else return false
-                }
-                return true
-            }
-        }
-        val events = GpuStabilityRepository(shell).runStabilityTest(
+    @Test
+    fun `a persistently rejected restore has its own failure reason`() = runBlocking {
+        val shell = PartialLockShell(allowRestore = false)
+        val events = runPartialLockTest(shell)
+
+        assertEquals(191L, shell.min)
+        assertEquals(3, shell.restoreWrites)
+        val point = events.first() as GpuStabilityRepository.TestEvent.PointFinished
+        assertEquals(FailureReason.WriteFreqRejected, point.result.failureReason)
+        assertEquals(GpuStabilityRepository.TestEvent.Failed(FailureReason.RestoreLimitsFailed), events.last())
+    }
+
+    private suspend fun runPartialLockTest(shell: ShellExecutor): List<GpuStabilityRepository.TestEvent> =
+        GpuStabilityRepository(shell).runStabilityTest(
             GpuStabilityUiState(activeFrequenciesHz = listOf(191_000_000L), durationPerPointSec = 0),
         ).toList()
 
-        assertEquals(160L, min)
-        assertEquals(1_200L, max)
-        assertEquals(2, events.size)
-        assertEquals(GpuStabilityRepository.TestEvent.Failed(FailureReason.WriteFreqRejected), events.last())
+    private class PartialLockShell(private val allowRestore: Boolean) : ShellExecutor {
+        override val isRootMode = true
+        var min = 160L
+            private set
+        val max = 1_200L
+        var restoreWrites = 0
+            private set
+        private var inconsistentRead = false
+
+        override suspend fun execForOutput(vararg commands: String): List<String> {
+            val command = commands.single()
+            if (!command.startsWith("cat") || "min_clock_mhz" !in command || "max_clock_mhz" !in command) {
+                return emptyList()
+            }
+            if (inconsistentRead) {
+                inconsistentRead = false
+                return listOf("826", "500")
+            }
+            return listOf(min.toString(), max.toString())
+        }
+
+        override suspend fun execAndCheck(vararg commands: String): Boolean {
+            val command = commands.single()
+            if (command.startsWith("[")) return "min_clock_mhz" in command
+            for (write in command.split(" && ")) {
+                if ("/max_clock_mhz" in write) {
+                    inconsistentRead = true
+                    return false
+                }
+                val value = write.split(' ')[1].toLong()
+                if (value == 160L) {
+                    restoreWrites++
+                    if (!allowRestore) return false
+                }
+                min = value
+            }
+            return true
+        }
     }
 }

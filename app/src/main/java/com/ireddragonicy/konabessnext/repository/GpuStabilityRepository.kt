@@ -44,6 +44,8 @@ class GpuStabilityRepository @Inject constructor(
 
     companion object {
         private const val TAG = "GpuStabilityRepo"
+        private const val LIMIT_ATTEMPTS = 4
+        private const val LIMIT_RETRY_DELAY_MS = 100L
 
         /** Sysfs paths probed for the active Adreno frequency table. */
         val PROBE_COMMANDS: List<String> = RuntimeGpuFrequencyProbe.candidates.map { it.command }
@@ -172,7 +174,7 @@ class GpuStabilityRepository @Inject constructor(
             return@flow
         }
         val original = readOriginalLimits(lockTarget) ?: run {
-            publish(TestEvent.Failed(FailureReason.WriteFreqRejected))
+            publish(TestEvent.Failed(FailureReason.FrequencyLimitsUnreadable))
             return@flow
         }
         _running.value = true
@@ -202,7 +204,7 @@ class GpuStabilityRepository @Inject constructor(
         }
         publish(
             when {
-                !restored -> TestEvent.Failed(FailureReason.WriteFreqRejected)
+                !restored -> TestEvent.Failed(FailureReason.RestoreLimitsFailed)
                 stopped -> TestEvent.Aborted
                 failure != null -> TestEvent.Failed(failure)
                 else -> TestEvent.AllCompleted
@@ -263,74 +265,78 @@ class GpuStabilityRepository @Inject constructor(
         _running.value = false
     }
 
-    /**
-     * Try to lock the GPU at [targetFreqHz]. Returns true on success. Used by callers
-     * (and tests) that want to drive a single frequency manually.
-     */
-    internal suspend fun pinFrequency(
+    /** Lock the GPU to [targetValue] in the units used by [lockTarget]. */
+    private suspend fun pinFrequency(
         lockTarget: GpuFrequencyLockTarget,
-        targetFreqHz: Long,
-    ): Boolean = withContext(Dispatchers.IO) {
-        if (!shellExecutor.isRootMode) return@withContext false
-        val targetValue = lockTarget.rawValueForHz(targetFreqHz) ?: return@withContext false
-        val current = readRawLimits(lockTarget) ?: return@withContext false
+        targetValue: Long,
+    ): Boolean {
+        if (!shellExecutor.isRootMode) return false
 
         // Min == max is sufficient to pin devfreq. Switching governor is a
         // best-effort optimization because several vendor kernels expose a
         // read-only or restricted governor while still allowing range writes.
         lockTarget.governorPath?.let {
-            runCatching { shellExecutor.execAndCheck("echo performance > '$it'") }
+            shellExecutor.execAndCheck("echo performance > '$it'")
         }
+        val requested = targetValue to targetValue
+        val current = readRawLimits(lockTarget) ?: return false
+        return writeLimits(lockTarget, current, requested) && verifyLimits(lockTarget, requested)
+    }
+
+    private suspend fun writeLimits(
+        target: GpuFrequencyLockTarget,
+        current: Pair<Long, Long>,
+        requested: Pair<Long, Long>,
+    ): Boolean {
+        if (current == requested) return true
         val commands = RuntimeGpuFrequencyLock.buildTransitionCommands(
-            target = lockTarget,
+            target = target,
             currentMin = current.first,
             currentMax = current.second,
-            requestedMin = targetValue,
-            requestedMax = targetValue,
+            requestedMin = requested.first,
+            requestedMax = requested.second,
         )
-        if (commands.isEmpty() && current != (targetValue to targetValue)) return@withContext false
-        if (commands.isNotEmpty() && !shellExecutor.execAndCheck(commands.joinToString(" && "))) {
-            return@withContext false
-        }
+        return commands.isNotEmpty() && shellExecutor.execAndCheck(commands.joinToString(" && "))
+    }
 
-        readRawLimits(lockTarget) == (targetValue to targetValue)
+    private suspend fun verifyLimits(
+        target: GpuFrequencyLockTarget,
+        requested: Pair<Long, Long>,
+    ): Boolean {
+        if (readRawLimits(target) != requested) return false
+        delay(LIMIT_RETRY_DELAY_MS)
+        return readRawLimits(target) == requested
     }
 
     /**
-     * Best-effort restore of the limits captured in [original]. Always called in a
-     * `NonCancellable` context, even when the sweep is cancelled, so we don't leave
-     * the GPU pinned to a single frequency.
+     * Called in a `NonCancellable` context. Re-read the limits before each
+     * attempt so retries can recover from partially applied writes.
      */
     private suspend fun restoreLimits(original: OriginalLimits): Boolean {
         if (!shellExecutor.isRootMode) return false
-        try {
-            val (requestedMin, requestedMax) = original.limits
-            val current = readRawLimits(original.target)
-            if (current != null) {
-                val commands = RuntimeGpuFrequencyLock.buildTransitionCommands(
-                    target = original.target,
-                    currentMin = current.first,
-                    currentMax = current.second,
-                    requestedMin = requestedMin,
-                    requestedMax = requestedMax,
-                )
-                if (commands.isNotEmpty()) shellExecutor.execAndCheck(commands.joinToString(" && "))
-            }
-            val governorPath = original.target.governorPath
-            val governor = original.governor
-            val governorRestored = if (governorPath != null && governor != null) {
-                if (readGovernor(governorPath) != governor) {
-                    shellExecutor.execAndCheck("echo '$governor' > '$governorPath'")
+        val governorPath = original.target.governorPath
+        val governor = original.governor
+        repeat(LIMIT_ATTEMPTS) { attempt ->
+            if (attempt > 0) delay(LIMIT_RETRY_DELAY_MS)
+            try {
+                val current = readRawLimits(original.target)
+                if (current != null) writeLimits(original.target, current, original.limits)
+                val governorRestored = if (governorPath != null && governor != null) {
+                    if (readGovernor(governorPath) != governor) {
+                        shellExecutor.execAndCheck("echo '$governor' > '$governorPath'")
+                    }
+                    readGovernor(governorPath) == governor
+                } else {
+                    true
                 }
-                readGovernor(governorPath) == governor
-            } else {
-                true
+                if (governorRestored && verifyLimits(original.target, original.limits)) return true
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Log.w(TAG, "GPU limit restore attempt ${attempt + 1} failed", e)
             }
-            return governorRestored && readRawLimits(original.target) == original.limits
-        } catch (e: Exception) {
-            Log.w(TAG, "restoreLimits failed: ${e.message}")
-            return false
         }
+        return false
     }
 
     private suspend fun testFrequency(
@@ -340,8 +346,8 @@ class GpuStabilityRepository @Inject constructor(
         throttleRatioPct: Int,
         onSample: suspend (GpuSample) -> Unit = {},
     ): FreqPointResult {
-        val pinned = pinFrequency(lockTarget, targetFreqHz)
-        if (!pinned) {
+        val targetValue = lockTarget.rawValueForHz(targetFreqHz)
+        if (targetValue == null || !pinFrequency(lockTarget, targetValue)) {
             return FreqPointResult(
                 targetFreqHz = targetFreqHz,
                 passed = false,
@@ -360,14 +366,24 @@ class GpuStabilityRepository @Inject constructor(
         val startMs = System.currentTimeMillis()
         var failureReason: FailureReason? = null
         val tickMs = startMs + 1000L
+        val lockedLimits = targetValue to targetValue
         for (sec in 0 until durationSec) {
+            val now = System.currentTimeMillis()
+            val sleepMs = (tickMs + sec * 1000L) - now
+            if (sleepMs > 0) delay(sleepMs)
             if (!_running.value) {
                 failureReason = FailureReason.AbortedByUser
                 break
             }
-            val now = System.currentTimeMillis()
-            val sleepMs = (tickMs + sec * 1000L) - now
-            if (sleepMs > 0) delay(sleepMs)
+            if (readRawLimits(lockTarget) != lockedLimits) {
+                delay(LIMIT_RETRY_DELAY_MS)
+                val confirmed = readRawLimits(lockTarget)
+                if (confirmed != lockedLimits) {
+                    failureReason = if (confirmed == null) FailureReason.FrequencyLimitsUnreadable
+                    else FailureReason.FrequencyLimitsChanged
+                    break
+                }
+            }
             val sample = readSample(targetFreqHz)
             samples += sample
             // Stream this sample up to the caller (the ViewModel appends it to
@@ -474,10 +490,9 @@ class GpuStabilityRepository @Inject constructor(
     }
 
     private suspend fun readRawLimits(target: GpuFrequencyLockTarget): Pair<Long, Long>? {
-        val minValue = shellExecutor.execForOutput("cat '${target.minPath}'")
-            .firstOrNull()?.trim()?.toLongOrNull()
-        val maxValue = shellExecutor.execForOutput("cat '${target.maxPath}'")
-            .firstOrNull()?.trim()?.toLongOrNull()
+        val values = shellExecutor.execForOutput("cat '${target.minPath}' '${target.maxPath}'")
+        val minValue = values.getOrNull(0)?.trim()?.toLongOrNull()
+        val maxValue = values.getOrNull(1)?.trim()?.toLongOrNull()
         return if (minValue != null && maxValue != null && minValue > 0L && minValue <= maxValue) {
             minValue to maxValue
         } else {
@@ -490,13 +505,19 @@ class GpuStabilityRepository @Inject constructor(
             ?.takeIf { it.matches(Regex("[a-zA-Z0-9_-]+")) }
 
     private suspend fun readOriginalLimits(target: GpuFrequencyLockTarget): OriginalLimits? {
-        val limits = readRawLimits(target) ?: return null
-        val governor = target.governorPath?.let { readGovernor(it) }
-        return OriginalLimits(
-            target = if (governor == null) target.copy(governorPath = null) else target,
-            governor = governor,
-            limits = limits,
-        )
+        repeat(LIMIT_ATTEMPTS) { attempt ->
+            if (attempt > 0) delay(LIMIT_RETRY_DELAY_MS)
+            val limits = readRawLimits(target) ?: return@repeat
+            val governor = target.governorPath?.let { readGovernor(it) }
+            if (verifyLimits(target, limits)) {
+                return OriginalLimits(
+                    target = if (governor == null) target.copy(governorPath = null) else target,
+                    governor = governor,
+                    limits = limits,
+                )
+            }
+        }
+        return null
     }
 
     /**

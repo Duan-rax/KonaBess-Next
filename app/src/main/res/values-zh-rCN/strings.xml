@@ -782,6 +782,9 @@
     <!-- Failure reasons surfaced from the Repository. -->
     <string name="stability_failure_aborted_by_user">用户中止了测试</string>
     <string name="stability_failure_write_freq_rejected">内核拒绝锁定 GPU 频率</string>
+    <string name="stability_failure_limits_unreadable">无法读取一致的 GPU 频率上下限</string>
+    <string name="stability_failure_limits_changed">测试期间 GPU 频率上下限被改动</string>
+    <string name="stability_failure_restore_limits">未能恢复测试前的 GPU 设置</string>
     <string name="stability_failure_renderer_gl_fmt">渲染器报告了 GL 错误：%1$s</string>
     <string name="stability_failure_throttled_below_fmt">GPU 频率被限制到目标值的 %1$d%% 以下</string>
     <string name="stability_failure_no_load">GPU 占用率持续为 0%% — 压测未能生效</string>

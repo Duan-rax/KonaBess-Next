@@ -839,6 +839,9 @@
          com.ireddragonicy.konabessnext.model.gpu.FailureReason cases. -->
     <string name="stability_failure_aborted_by_user">Aborted by user</string>
     <string name="stability_failure_write_freq_rejected">Kernel refused to lock the GPU frequency</string>
+    <string name="stability_failure_limits_unreadable">Could not read a consistent GPU frequency range</string>
+    <string name="stability_failure_limits_changed">GPU frequency limits changed during the test</string>
+    <string name="stability_failure_restore_limits">Could not restore the GPU settings saved before the test</string>
     <string name="stability_failure_renderer_gl_fmt">Renderer reported a GL error: %1$s</string>
     <string name="stability_failure_throttled_below_fmt">GPU throttled below %1$d%% of target</string>
     <string name="stability_failure_no_load">GPU load stayed at 0%% — stress failed to engage</string>

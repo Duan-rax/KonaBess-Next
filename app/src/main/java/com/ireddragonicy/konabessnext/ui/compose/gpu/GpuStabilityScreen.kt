@@ -575,9 +575,7 @@ private fun ResultsList(state: GpuStabilityUiState) {
             )
             Spacer(Modifier.size(8.dp))
             Column(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .heightIn(max = 200.dp),
+                modifier = Modifier.fillMaxWidth(),
                 verticalArrangement = Arrangement.spacedBy(6.dp),
             ) {
                 state.results.forEach { result ->
@@ -828,6 +826,12 @@ private fun Stepper(
 private fun FailureReason.localized(): String = when (this) {
     FailureReason.AbortedByUser -> stringResource(R.string.stability_failure_aborted_by_user)
     FailureReason.WriteFreqRejected -> stringResource(R.string.stability_failure_write_freq_rejected)
+    FailureReason.FrequencyLimitsUnreadable ->
+        stringResource(R.string.stability_failure_limits_unreadable)
+    FailureReason.FrequencyLimitsChanged ->
+        stringResource(R.string.stability_failure_limits_changed)
+    FailureReason.RestoreLimitsFailed ->
+        stringResource(R.string.stability_failure_restore_limits)
     is FailureReason.RendererGlError ->
         stringResource(R.string.stability_failure_renderer_gl_fmt, glErrorHex)
     is FailureReason.ThrottledBelow ->

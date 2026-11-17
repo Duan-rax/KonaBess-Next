@@ -52,6 +52,12 @@ sealed class FailureReason {
     /** min_freq/max_freq writes were rejected (permissions, kernel locked, etc.). */
     object WriteFreqRejected : FailureReason()
 
+    object FrequencyLimitsUnreadable : FailureReason()
+
+    object FrequencyLimitsChanged : FailureReason()
+
+    object RestoreLimitsFailed : FailureReason()
+
     /** OpenGL renderer reported an error during the point. */
     data class RendererGlError(val glErrorHex: String) : FailureReason()
 
