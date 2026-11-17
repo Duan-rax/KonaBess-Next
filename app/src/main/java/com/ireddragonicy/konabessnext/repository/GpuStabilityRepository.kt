@@ -46,16 +46,8 @@ class GpuStabilityRepository @Inject constructor(
     companion object {
         private const val TAG = "GpuStabilityRepo"
 
-        /** sysfs paths probed for the Adreno devfreq node. Mirrors [DeviceRepository.getRunTimeGpuFrequencies]. */
-        val PROBE_COMMANDS: List<String> = listOf(
-            "cat /sys/class/kgsl/kgsl-3d0/frequencies",
-            "cat /sys/class/kgsl/kgsl-3d0/available_frequencies",
-            "cat /sys/class/kgsl/kgsl-3d0/devfreq/available_frequencies",
-            "cat /sys/devices/platform/soc/*.qcom,kgsl-3d0/kgsl/kgsl-3d0/frequencies",
-            "cat /sys/devices/platform/soc/*.qcom,kgsl-3d0/kgsl/kgsl-3d0/available_frequencies",
-            "cat /sys/devices/platform/soc@0/*.qcom,kgsl-3d0/kgsl/kgsl-3d0/frequencies",
-            "cat /sys/devices/platform/*.qcom,kgsl-3d0/kgsl/kgsl-3d0/frequencies",
-        )
+        /** Sysfs paths probed for the active Adreno frequency table. */
+        val PROBE_COMMANDS: List<String> = RuntimeGpuFrequencyProbe.candidates.map { it.command }
 
         /** sysfs paths for the per-frequency governor / min / max knobs. */
         val GOV_NODE_CANDIDATES: List<String> = listOf(
@@ -126,15 +118,15 @@ class GpuStabilityRepository @Inject constructor(
         if (!shellExecutor.isRootMode) {
             return@withContext DomainResult.Failure(AppError.RootAccessError())
         }
-        for (command in PROBE_COMMANDS) {
+        for (candidate in RuntimeGpuFrequencyProbe.candidates) {
             val output = try {
-                shellExecutor.execForOutput(command)
+                shellExecutor.execForOutput(candidate.command)
             } catch (_: SecurityException) {
                 continue
             } catch (_: Exception) {
                 continue
             }
-            val parsed = parseFrequencyList(output)
+            val parsed = RuntimeGpuFrequencyProbe.parse(output, candidate)
             if (parsed.isNotEmpty()) {
                 return@withContext DomainResult.Success(parsed.sorted())
             }
@@ -480,25 +472,6 @@ class GpuStabilityRepository @Inject constructor(
                 .firstOrNull()?.trim()?.toLongOrNull(),
             nodeDir = nodeDir,
         )
-    }
-
-    private fun parseFrequencyList(lines: List<String>): List<Long> {
-        if (lines.isEmpty()) return emptyList()
-        return lines.asSequence()
-            .flatMap { line ->
-                line.replace(",", " ")
-                    .split(Regex("\\s+"))
-                    .asSequence()
-            }
-            .map { it.trim() }
-            .filter { it.isNotEmpty() }
-            .mapNotNull { token ->
-                if (token.startsWith("0x", ignoreCase = true)) token.substring(2).toLongOrNull(16)
-                else token.toLongOrNull()
-            }
-            .filter { it > 0L }
-            .toList()
-            .distinct()
     }
 
     /**

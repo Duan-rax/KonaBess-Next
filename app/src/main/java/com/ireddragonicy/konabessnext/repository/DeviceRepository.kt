@@ -458,26 +458,16 @@ open class DeviceRepository @Inject constructor(
     }
 
     override suspend fun getRunTimeGpuFrequencies(): DomainResult<List<Long>> = withContext(Dispatchers.IO) {
-        val probeCommands = listOf(
-            "cat /sys/class/kgsl/kgsl-3d0/frequencies",
-            "cat /sys/class/kgsl/kgsl-3d0/available_frequencies",
-            "cat /sys/class/kgsl/kgsl-3d0/devfreq/available_frequencies",
-            "cat /sys/devices/platform/soc/*.qcom,kgsl-3d0/kgsl/kgsl-3d0/frequencies",
-            "cat /sys/devices/platform/soc/*.qcom,kgsl-3d0/kgsl/kgsl-3d0/available_frequencies",
-            "cat /sys/devices/platform/soc@0/*.qcom,kgsl-3d0/kgsl/kgsl-3d0/frequencies",
-            "cat /sys/devices/platform/*.qcom,kgsl-3d0/kgsl/kgsl-3d0/frequencies"
-        )
-
-        for (command in probeCommands) {
+        for (candidate in RuntimeGpuFrequencyProbe.candidates) {
             val output = try {
-                shellRepository.execForOutput(command)
+                shellRepository.execForOutput(candidate.command)
             } catch (securityException: SecurityException) {
                 continue
             } catch (_: Exception) {
                 continue
             }
 
-            val parsed = parseRuntimeFrequencyOutput(output)
+            val parsed = RuntimeGpuFrequencyProbe.parse(output, candidate)
             if (parsed.isNotEmpty()) {
                 return@withContext DomainResult.Success(parsed)
             }
@@ -919,28 +909,6 @@ open class DeviceRepository @Inject constructor(
             needsCaTargetOffset = false,
             models = listOf(displayModel)
         )
-    }
-
-    private fun parseRuntimeFrequencyOutput(lines: List<String>): List<Long> {
-        if (lines.isEmpty()) return emptyList()
-
-        return lines.asSequence()
-            .flatMap { line ->
-                line.replace(",", " ")
-                    .split(Regex("\\s+"))
-                    .asSequence()
-            }
-            .map { it.trim() }
-            .filter { it.isNotEmpty() }
-            .mapNotNull { token ->
-                if (token.startsWith("0x", ignoreCase = true)) {
-                    token.substring(2).toLongOrNull(16)
-                } else {
-                    token.toLongOrNull()
-                }
-            }
-            .filter { it > 0L }
-            .toList()
     }
 
     private fun readFileToString(file: File): String = BufferedReader(FileReader(file)).use { it.readText() }

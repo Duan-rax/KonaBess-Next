@@ -127,4 +127,35 @@ class DeviceRepositoryTest {
         // Cleanup
         bootNew.delete()
     }
+
+    @Test
+    fun testGetRunTimeGpuFrequencies_ReadsNewKgslNode() = runTest {
+        val command = "cat /sys/class/kgsl/kgsl-3d0/gpu_available_frequencies"
+        coEvery { shellRepository.execForOutput(command) } returns listOf(
+            "1200000000 1100000000 902000000 160000000"
+        )
+
+        val result = deviceRepository.getRunTimeGpuFrequencies()
+
+        assertEquals(
+            DomainResult.Success(listOf(1_200_000_000L, 1_100_000_000L, 902_000_000L, 160_000_000L)),
+            result,
+        )
+        coVerify(exactly = 1) { shellRepository.execForOutput(command) }
+    }
+
+    @Test
+    fun testGetRunTimeGpuFrequencies_ConvertsMhzFallbackToHz() = runTest {
+        coEvery { shellRepository.execForOutput(any()) } returns emptyList()
+        val command = "cat /sys/class/kgsl/kgsl-3d0/freq_table_mhz"
+        coEvery { shellRepository.execForOutput(command) } returns listOf("1200 902 160")
+
+        val result = deviceRepository.getRunTimeGpuFrequencies()
+
+        assertEquals(
+            DomainResult.Success(listOf(1_200_000_000L, 902_000_000L, 160_000_000L)),
+            result,
+        )
+        coVerify(exactly = 1) { shellRepository.execForOutput(command) }
+    }
 }
